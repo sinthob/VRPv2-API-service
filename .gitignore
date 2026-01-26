@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Cache
+cache/
+.cache/
+*.cache
+
+# Test Files (ไม่จำเป็นสำหรับ deploy)
+test_*.py
+test_*.sql
+*_test.py
+
+# Test Output Files
+test_output/
+vrp_request_from_db.json
+vrp_solution_from_db.json
+
+# Documentation (ไม่จำเป็นสำหรับ deploy)
+DEPLOYMENT.md
+README_DB_TEST.md
+ENV_SETUP.md
+
+# Development Utilities (ไม่จำเป็นสำหรับ deploy)
+convert_template_to_json.py
+create_template.py
+
+# Analysis & Visualization (ไม่จำเป็นสำหรับ deploy)
+analysis/
+visualizations/
+
+# Results & Outputs (ไม่จำเป็นสำหรับ deploy)
+results_v2/
+inputs/
+!inputs/vrp_input_template.xlsx
+
+# Templates
+vrp_input_template.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
