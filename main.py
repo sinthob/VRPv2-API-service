@@ -426,13 +426,22 @@ def create_mock_solution(
 
 # ==================== Go Backend Compatible Endpoint ====================
 
+class GoBackendVehicle(BaseModel):
+    """Vehicle format from Go backend"""
+    vehicle_id: str
+    fixed_cost: float
+    capacity_regular: int
+    capacity_recycle: int
+    fuel_cost_per_km: float
+
+
 class GoBackendSolveRequest(BaseModel):
     """Request format from Go backend dailyroute service"""
     hub_point_id: int
     point_ids_by_index: List[int]
     distance_matrix: List[List[float]]
     nodes: List[Dict[str, int]]  # point_id, demand_regular, demand_recycle
-    vehicles: List[Dict[str, float]]  # vehicle_id(str), fixed_cost, capacity_regular, capacity_recycle, fuel_cost_per_km
+    vehicles: List[GoBackendVehicle]
 
 
 class GoBackendRouteOut(BaseModel):
@@ -471,7 +480,7 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
         # Simple strategy: assign all points to first vehicle
         if len(request.vehicles) > 0 and len(request.nodes) > 0:
             vehicle = request.vehicles[0]
-            vehicle_id = vehicle["vehicle_id"]
+            vehicle_id = vehicle.vehicle_id  # Access as attribute, not dict
             
             # Route: hub -> all nodes -> hub
             route_point_ids = [request.hub_point_id]
@@ -494,8 +503,8 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
                     pass
             
             distance_km = distance_m / 1000.0
-            fuel_cost = distance_km * vehicle["fuel_cost_per_km"]
-            fixed_cost = vehicle["fixed_cost"]
+            fuel_cost = distance_km * vehicle.fuel_cost_per_km  # Access as attribute
+            fixed_cost = vehicle.fixed_cost  # Access as attribute
             total_cost = fixed_cost + fuel_cost
             
             routes.append(GoBackendRouteOut(
