@@ -521,67 +521,136 @@ class GoBackendSolveResponse(BaseModel):
 async def solve_for_go_backend(request: GoBackendSolveRequest):
     """
     Solve VRP for Go backend dailyroute service
-    Simplified format matching SolverClient expectations
+    Uses VRPSolverV2 and maps solver node IDs back to database point IDs
     """
     try:
         logger.info(f"Received Go backend request: {len(request.nodes)} nodes, {len(request.vehicles)} vehicles")
+        logger.info(f"Hub point ID: {request.hub_point_id}")
+        logger.info(f"Point IDs by index: {request.point_ids_by_index}")
         
-        # For mock implementation, create simple sequential routes
+        if not SOLVER_AVAILABLE:
+            return GoBackendSolveResponse(
+                success=False,
+                routes=[],
+                summary={},
+                message="VRP Solver is not available"
+            )
+        
+        # Build solver input
+        # point_ids_by_index = [hub_id, collection_point_ids...]
+        # Solver expects: Node 1 = hub (index 0), Node 2-N = collection points
+        
+        num_nodes = len(request.point_ids_by_index)
+        distance_matrix = np.array(request.distance_matrix, dtype=float)
+        
+        # Create SolverNode objects
+        solver_nodes = []
+        node_demand_map = {n["point_id"]: n for n in request.nodes}
+        
+        for idx, point_id in enumerate(request.point_ids_by_index):
+            node_id = idx + 1  # 1-indexed for solver
+            
+            # Get demand (hub has 0 demand)
+            demand_regular = 0
+            demand_recycle = 0
+            if point_id != request.hub_point_id and point_id in node_demand_map:
+                demand_regular = node_demand_map[point_id]["demand_regular"]
+                demand_recycle = node_demand_map[point_id]["demand_recycle"]
+            
+            solver_node = SolverNode(
+                id=node_id,
+                name=f"Point {point_id}",
+                general_demand=float(demand_regular),
+                recycle_demand=float(demand_recycle),
+                is_depot=(idx == 0),  # First node is hub/depot
+                is_checkpoint=False  # No checkpoint for Go backend
+            )
+            solver_nodes.append(solver_node)
+        
+        # Create SolverVehicle objects
+        solver_vehicles = []
+        for vehicle in request.vehicles:
+            solver_vehicle = SolverVehicle(
+                type_id=vehicle.vehicle_id,
+                general_capacity=float(vehicle.capacity_regular),
+                recycle_capacity=float(vehicle.capacity_recycle),
+                fixed_cost=float(vehicle.fixed_cost),
+                fuel_cost_per_km=float(vehicle.fuel_cost_per_km)
+            )
+            solver_vehicles.append(solver_vehicle)
+        
+        # Use best vehicle
+        best_vehicle = min(solver_vehicles, key=lambda v: v.fuel_cost_per_km)
+        
+        # Calculate minimum vehicles needed
+        total_general = sum(n.general_demand for n in solver_nodes)
+        total_recycle = sum(n.recycle_demand for n in solver_nodes)
+        
+        import math
+        min_veh_gen = math.ceil(total_general / best_vehicle.general_capacity) if best_vehicle.general_capacity > 0 else 1
+        min_veh_rec = math.ceil(total_recycle / best_vehicle.recycle_capacity) if best_vehicle.recycle_capacity > 0 else 1
+        num_vehicles = max(min_veh_gen, min_veh_rec, 1)
+        
+        depot_idx = 0
+        checkpoint_idx = num_nodes - 1  # Use last node as checkpoint (won't be used since is_checkpoint=False)
+        
+        logger.info(f"Solving with {num_vehicles} vehicles using OR-Tools...")
+        
+        # Solve using VRPSolverV2
+        from solvers.vrp_solver_v2 import VRPSolverV2
+        solver = VRPSolverV2.__new__(VRPSolverV2)
+        
+        try:
+            solver_solution = solver._solve_ortools(
+                solver_nodes, best_vehicle, distance_matrix,
+                depot_idx, checkpoint_idx, num_vehicles, 60
+            )
+        except Exception as e:
+            logger.warning(f"OR-Tools solver failed: {e}, falling back to heuristic")
+            solver_solution = solver._solve_heuristic(
+                solver_nodes, best_vehicle, distance_matrix,
+                depot_idx, checkpoint_idx
+            )
+        
+        # Convert solver solution back to database point IDs
         routes = []
         total_distance_m = 0
         total_fixed_cost = 0.0
         total_fuel_cost = 0.0
         
-        # Simple strategy: assign all points to first vehicle
-        if len(request.vehicles) > 0 and len(request.nodes) > 0:
-            vehicle = request.vehicles[0]
-            vehicle_id = vehicle.vehicle_id  # Access as attribute, not dict
+        for solver_route in solver_solution.routes:
+            # Convert solver node IDs (1-indexed) to database point IDs
+            point_ids = []
+            for node_id in solver_route.nodes:
+                idx = node_id - 1  # Convert to 0-indexed
+                point_id = request.point_ids_by_index[idx]
+                point_ids.append(point_id)
             
-            # Route: hub -> all nodes -> hub
-            route_point_ids = [request.hub_point_id]
-            for node in request.nodes:
-                route_point_ids.append(node["point_id"])
-            route_point_ids.append(request.hub_point_id)
-            
-            # Calculate distance
-            distance_m = 0
-            for i in range(len(route_point_ids) - 1):
-                from_id = route_point_ids[i]
-                to_id = route_point_ids[i + 1]
-                
-                # Find indices in point_ids_by_index
-                try:
-                    from_idx = request.point_ids_by_index.index(from_id)
-                    to_idx = request.point_ids_by_index.index(to_id)
-                    distance_m += int(request.distance_matrix[from_idx][to_idx])
-                except (ValueError, IndexError):
-                    pass
-            
-            distance_km = distance_m / 1000.0
-            fuel_cost = distance_km * vehicle.fuel_cost_per_km  # Access as attribute
-            fixed_cost = vehicle.fixed_cost  # Access as attribute
-            total_cost = fixed_cost + fuel_cost
+            # Find vehicle from original request
+            vehicle = next((v for v in request.vehicles if v.vehicle_id == solver_route.vehicle_type), request.vehicles[0])
             
             routes.append(GoBackendRouteOut(
-                vehicle_id=vehicle_id,
-                point_ids=route_point_ids,
-                distance_m=distance_m,
-                fixed_cost=fixed_cost,
-                fuel_cost=fuel_cost,
-                total_cost=total_cost
+                vehicle_id=solver_route.vehicle_type,
+                point_ids=point_ids,
+                distance_m=int(solver_route.distance_meters),
+                fixed_cost=solver_route.fixed_cost,
+                fuel_cost=solver_route.fuel_cost,
+                total_cost=solver_route.total_cost
             ))
             
-            total_distance_m = distance_m
-            total_fixed_cost = fixed_cost
-            total_fuel_cost = fuel_cost
+            total_distance_m += solver_route.distance_meters
+            total_fixed_cost += solver_route.fixed_cost
+            total_fuel_cost += solver_route.fuel_cost
         
         summary = {
             "total_cost": total_fixed_cost + total_fuel_cost,
             "total_fixed_cost": total_fixed_cost,
             "total_fuel_cost": total_fuel_cost,
-            "total_distance_m": total_distance_m,
+            "total_distance_m": float(total_distance_m),
             "total_vehicles": len(routes)
         }
+        
+        logger.info(f"Solution generated: {len(routes)} routes, {total_distance_m/1000:.2f} km, {summary['total_cost']:.2f} THB")
         
         return GoBackendSolveResponse(
             success=True,
@@ -590,7 +659,7 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
         )
         
     except Exception as e:
-        logger.error(f"Error solving VRP for Go backend: {e}")
+        logger.error(f"Error solving VRP for Go backend: {e}", exc_info=True)
         return GoBackendSolveResponse(
             success=False,
             routes=[],
