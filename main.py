@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Import VRP solver
 try:
-    from solvers.vrp_solver_v2 import VRPSolverV2
+    from solvers.vrp_solver_v2 import VRPSolverV2, Node as SolverNode, Vehicle as SolverVehicle, Solution as SolverSolution
     SOLVER_AVAILABLE = True
     logger.info("VRP Solver loaded successfully")
 except ImportError as e:
@@ -292,36 +292,42 @@ async def solve_vrp(request: VRPRequest):
         # Prepare solver input (convert to VRPv2 format)
         solver_nodes = []
         for idx, node in enumerate(all_nodes):
-            solver_node = {
-                'id': idx + 1,  # 1-indexed
-                'name': node.name,
-                'general_demand': node.demand[0] if len(node.demand) > 0 else 0,
-                'recycle_demand': node.demand[1] if len(node.demand) > 1 else 0,
-                'is_depot': (idx == 0),  # Hub is always first
-                'is_checkpoint': (idx + 1 == checkpoint_id)
-            }
+            solver_node = SolverNode(
+                id=idx + 1,  # 1-indexed
+                name=node.name,
+                general_demand=float(node.demand[0] if len(node.demand) > 0 else 0),
+                recycle_demand=float(node.demand[1] if len(node.demand) > 1 else 0),
+                is_depot=(idx == 0),  # Hub is always first
+                is_checkpoint=(idx + 1 == checkpoint_id)
+            )
             solver_nodes.append(solver_node)
         
         solver_vehicles = []
         for vehicle in request.vehicles:
-            solver_vehicle = {
-                'type_id': vehicle.id,
-                'general_capacity': vehicle.capacity[0] if len(vehicle.capacity) > 0 else 2000,
-                'recycle_capacity': vehicle.capacity[1] if len(vehicle.capacity) > 1 else 200,
-                'fixed_cost': vehicle.fixed_cost,
-                'fuel_cost_per_km': vehicle.cost_per_km
-            }
+            solver_vehicle = SolverVehicle(
+                type_id=vehicle.id,
+                general_capacity=float(vehicle.capacity[0] if len(vehicle.capacity) > 0 else 2000),
+                recycle_capacity=float(vehicle.capacity[1] if len(vehicle.capacity) > 1 else 200),
+                fixed_cost=float(vehicle.fixed_cost),
+                fuel_cost_per_km=float(vehicle.cost_per_km)
+            )
             solver_vehicles.append(solver_vehicle)
         
-        # Create mock solution for now (TODO: Integrate with actual VRPSolverV2)
-        logger.info("Generating solution...")
+        # Call actual VRPSolverV2
+        logger.info("Solving VRP using OR-Tools...")
+        solver_solution = solve_vrp_internal(
+            solver_nodes,
+            solver_vehicles,
+            distance_matrix,
+            checkpoint_id,
+            time_limit=request.time_limit or 60
+        )
         
         # Build solution in Go backend format
-        solution_data = create_mock_solution(
-            all_nodes, 
-            request.vehicles, 
-            distance_matrix,
-            checkpoint_id
+        solution_data = convert_solver_solution_to_api_format(
+            solver_solution,
+            all_nodes,
+            request.vehicles
         )
         
         logger.info(f"Solution generated: {solution_data.solution_summary.total_vehicles} vehicles, "
@@ -343,18 +349,64 @@ async def solve_vrp(request: VRPRequest):
         )
 
 
-def create_mock_solution(
-    nodes: List[VRPNodeInput],
-    vehicles: List[VRPVehicle],
+def solve_vrp_internal(
+    nodes: List[SolverNode],
+    vehicles: List[SolverVehicle],
     distance_matrix: np.ndarray,
-    checkpoint_id: int
+    checkpoint_id: int,
+    time_limit: int = 60
+) -> SolverSolution:
+    """
+    Solve VRP using VRPSolverV2 internal algorithm
+    """
+    from solvers.vrp_solver_v2 import VRPSolverV2
+    
+    solver = VRPSolverV2.__new__(VRPSolverV2)
+    
+    # Use best vehicle (lowest fuel cost)
+    best_vehicle = min(vehicles, key=lambda v: v.fuel_cost_per_km)
+    
+    # Calculate minimum vehicles needed
+    total_general = sum(n.general_demand for n in nodes)
+    total_recycle = sum(n.recycle_demand for n in nodes)
+    
+    import math
+    min_veh_gen = math.ceil(total_general / best_vehicle.general_capacity) if best_vehicle.general_capacity > 0 else 1
+    min_veh_rec = math.ceil(total_recycle / best_vehicle.recycle_capacity) if best_vehicle.recycle_capacity > 0 else 1
+    num_vehicles = max(min_veh_gen, min_veh_rec, 1)
+    
+    depot_idx = 0  # Node 1 is always depot
+    checkpoint_idx = checkpoint_id - 1  # Convert to 0-indexed
+    
+    logger.info(f"Solving with {num_vehicles} vehicles, checkpoint at node {checkpoint_id}")
+    
+    # Try OR-Tools solver
+    try:
+        solution = solver._solve_ortools(
+            nodes, best_vehicle, distance_matrix,
+            depot_idx, checkpoint_idx, num_vehicles, time_limit
+        )
+    except Exception as e:
+        logger.warning(f"OR-Tools solver failed: {e}, falling back to heuristic")
+        solution = solver._solve_heuristic(
+            nodes, best_vehicle, distance_matrix,
+            depot_idx, checkpoint_idx
+        )
+    
+    # Validate solution
+    solution = solver._validate_solution(solution, nodes, checkpoint_idx)
+    
+    return solution
+
+
+def convert_solver_solution_to_api_format(
+    solver_solution: SolverSolution,
+    nodes: List[VRPNodeInput],
+    vehicles: List[VRPVehicle]
 ) -> VRPSolution:
     """
-    Create a mock solution matching Go backend format
-    TODO: Replace with actual VRPSolverV2 integration
+    Convert VRPSolverV2 solution to API response format
     """
-    
-    # Create simple routes (single vehicle visits all nodes)
     routes = []
     all_nodes_dict = {}
     
@@ -371,51 +423,43 @@ def create_mock_solution(
             is_required=node.is_required
         )
     
-    # Create a simple route for first vehicle
-    vehicle = vehicles[0]
-    route_nodes = [0] + list(range(1, len(nodes))) + [0]  # Visit all nodes
-    route_coordinates = [[nodes[i].latitude, nodes[i].longitude] for i in route_nodes]
-    route_names = [nodes[i].name for i in route_nodes]
-    
-    # Calculate route distance
-    total_distance_m = 0.0
-    for i in range(len(route_nodes) - 1):
-        from_idx = route_nodes[i]
-        to_idx = route_nodes[i + 1]
-        total_distance_m += distance_matrix[from_idx][to_idx]
-    
-    total_distance_km = total_distance_m / 1000.0
-    fuel_cost = total_distance_km * vehicle.cost_per_km
-    total_cost = vehicle.fixed_cost + fuel_cost
-    
-    route = Route(
-        trip_number=1,
-        vehicle=vehicle.id,
-        nodes=route_nodes,
-        coordinates=route_coordinates,
-        node_names=route_names,
-        deliveries=[i for i, n in enumerate(nodes) if n.is_delivery and i > 0],
-        distance=total_distance_km,
-        cost=total_cost,
-        fixed_cost=vehicle.fixed_cost,
-        fuel_cost=fuel_cost,
-        color=get_vehicle_color(vehicle.id)
-    )
-    
-    routes.append(route)
+    # Convert each route from solver format
+    for solver_route in solver_solution.routes:
+        # Convert 1-indexed node IDs to 0-indexed
+        route_nodes = [nid - 1 for nid in solver_route.nodes]
+        route_coordinates = [[nodes[i].latitude, nodes[i].longitude] for i in route_nodes]
+        route_names = [nodes[i].name for i in route_nodes]
+        
+        # Find vehicle
+        vehicle = next((v for v in vehicles if v.id == solver_route.vehicle_type), vehicles[0])
+        
+        route = Route(
+            trip_number=solver_route.vehicle_id,
+            vehicle=solver_route.vehicle_type,
+            nodes=route_nodes,
+            coordinates=route_coordinates,
+            node_names=route_names,
+            deliveries=[i for i, n in enumerate(nodes) if n.is_delivery and i > 0],
+            distance=solver_route.distance_km,
+            cost=solver_route.total_cost,
+            fixed_cost=solver_route.fixed_cost,
+            fuel_cost=solver_route.fuel_cost,
+            color=get_vehicle_color(solver_route.vehicle_type)
+        )
+        routes.append(route)
     
     # Build solution
     solution = VRPSolution(
         solution_summary=SolutionSummary(
-            total_cost=total_cost,
-            total_vehicles=1,
-            total_distance=total_distance_km
+            total_cost=solver_solution.total_cost,
+            total_vehicles=solver_solution.num_vehicles_used,
+            total_distance=solver_solution.total_distance_km
         ),
         routes=routes,
         all_nodes=all_nodes_dict,
         metadata=Metadata(
             generated_at=datetime.now(),
-            algorithm_used="OR-Tools + Heuristic",
+            algorithm_used="OR-Tools + Guided Local Search" if solver_solution.status == 'OPTIMAL' else "Heuristic",
             coordinate_system="WGS84 (GPS coordinates)",
             location="Thailand"
         )
