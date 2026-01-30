@@ -365,7 +365,7 @@ def solve_vrp_internal(
     time_limit: int = 60
 ) -> SolverSolution:
     """
-    Solve VRP using VRPSolverV2 internal algorithm
+    Solve VRP using VRPSolverV2 internal algorithm (with checkpoint)
     """
     from solvers.vrp_solver_v2 import VRPSolverV2
     
@@ -405,6 +405,156 @@ def solve_vrp_internal(
     solution = solver._validate_solution(solution, nodes, checkpoint_idx)
     
     return solution
+
+
+def solve_vrp_without_checkpoint(
+    nodes: List[SolverNode],
+    vehicle: SolverVehicle,
+    distance_matrix: np.ndarray,
+    depot_idx: int,
+    num_vehicles: int,
+    time_limit: int = 60
+) -> SolverSolution:
+    """
+    Solve VRP without checkpoint requirement (for Go backend)
+    Routes: depot → collection nodes → depot
+    """
+    try:
+        from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+    except ImportError:
+        raise Exception("OR-Tools not available")
+    
+    num_nodes = len(nodes)
+    
+    # OR-Tools setup
+    manager = pywrapcp.RoutingIndexManager(num_nodes, num_vehicles, depot_idx)
+    routing = pywrapcp.RoutingModel(manager)
+    
+    # Distance callback
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return int(distance_matrix[from_node][to_node])
+    
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    
+    # Demand callbacks
+    general_demands = [int(n.general_demand) for n in nodes]
+    recycle_demands = [int(n.recycle_demand) for n in nodes]
+    
+    def demand_general_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return general_demands[from_node]
+    
+    def demand_recycle_callback(from_index):
+        from_node = manager.IndexToNode(from_index)
+        return recycle_demands[from_node]
+    
+    # Add capacity dimensions
+    demand_gen_callback_index = routing.RegisterUnaryTransitCallback(demand_general_callback)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_gen_callback_index,
+        0,  # no slack
+        [int(vehicle.general_capacity)] * num_vehicles,
+        True,  # start cumul to zero
+        'GeneralCapacity'
+    )
+    
+    demand_rec_callback_index = routing.RegisterUnaryTransitCallback(demand_recycle_callback)
+    routing.AddDimensionWithVehicleCapacity(
+        demand_rec_callback_index,
+        0,
+        [int(vehicle.recycle_capacity)] * num_vehicles,
+        True,
+        'RecycleCapacity'
+    )
+    
+    # Search parameters
+    search_params = pywrapcp.DefaultRoutingSearchParameters()
+    search_params.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    )
+    search_params.local_search_metaheuristic = (
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    )
+    search_params.time_limit.seconds = time_limit
+    
+    # Solve
+    assignment = routing.SolveWithParameters(search_params)
+    
+    if not assignment:
+        raise Exception("OR-Tools could not find a solution")
+    
+    # Extract solution
+    from solvers.vrp_solver_v2 import Route, Solution
+    
+    routes = []
+    total_distance_m = 0
+    
+    for vehicle_id in range(num_vehicles):
+        index = routing.Start(vehicle_id)
+        route_nodes = []
+        general_load = 0
+        recycle_load = 0
+        
+        while not routing.IsEnd(index):
+            node_idx = manager.IndexToNode(index)
+            node = nodes[node_idx]
+            
+            route_nodes.append(node.id)  # 1-indexed
+            general_load += node.general_demand
+            recycle_load += node.recycle_demand
+            
+            index = assignment.Value(routing.NextVar(index))
+        
+        # Add final depot
+        route_nodes.append(nodes[depot_idx].id)
+        
+        # Only process non-trivial routes
+        if len(route_nodes) > 2:  # More than just depot -> depot
+            # Calculate distance
+            route_distance = 0.0
+            for i in range(len(route_nodes) - 1):
+                from_idx = route_nodes[i] - 1  # Convert to 0-indexed
+                to_idx = route_nodes[i + 1] - 1
+                route_distance += distance_matrix[from_idx][to_idx]
+            
+            distance_km = route_distance / 1000.0
+            fuel_cost = distance_km * vehicle.fuel_cost_per_km
+            
+            route = Route(
+                vehicle_id=vehicle_id + 1,
+                vehicle_type=vehicle.type_id,
+                nodes=route_nodes,  # [depot, ..., depot] with 1-indexed IDs
+                distance_meters=route_distance,
+                distance_km=distance_km,
+                general_load=general_load,
+                recycle_load=recycle_load,
+                fixed_cost=vehicle.fixed_cost,
+                fuel_cost=fuel_cost,
+                total_cost=vehicle.fixed_cost + fuel_cost
+            )
+            routes.append(route)
+            total_distance_m += route_distance
+    
+    total_distance_km = total_distance_m / 1000.0
+    total_fixed = sum(r.fixed_cost for r in routes)
+    total_fuel = sum(r.fuel_cost for r in routes)
+    
+    return Solution(
+        status='OPTIMAL',
+        routes=routes,
+        num_vehicles_used=len(routes),
+        total_distance_meters=total_distance_m,
+        total_distance_km=total_distance_km,
+        total_fixed_cost=total_fixed,
+        total_fuel_cost=total_fuel,
+        total_cost=total_fixed + total_fuel,
+        all_nodes_visited=True,
+        all_routes_valid=True,
+        validation_errors=[]
+    )
 
 
 def convert_solver_solution_to_api_format(
@@ -592,25 +742,14 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
         num_vehicles = max(min_veh_gen, min_veh_rec, 1)
         
         depot_idx = 0
-        checkpoint_idx = num_nodes - 1  # Use last node as checkpoint (won't be used since is_checkpoint=False)
         
         logger.info(f"Solving with {num_vehicles} vehicles using OR-Tools...")
         
-        # Solve using VRPSolverV2
-        from solvers.vrp_solver_v2 import VRPSolverV2
-        solver = VRPSolverV2.__new__(VRPSolverV2)
-        
-        try:
-            solver_solution = solver._solve_ortools(
-                solver_nodes, best_vehicle, distance_matrix,
-                depot_idx, checkpoint_idx, num_vehicles, 60
-            )
-        except Exception as e:
-            logger.warning(f"OR-Tools solver failed: {e}, falling back to heuristic")
-            solver_solution = solver._solve_heuristic(
-                solver_nodes, best_vehicle, distance_matrix,
-                depot_idx, checkpoint_idx
-            )
+        # Solve using OR-Tools directly (without checkpoint requirement)
+        solver_solution = solve_vrp_without_checkpoint(
+            solver_nodes, best_vehicle, distance_matrix,
+            depot_idx, num_vehicles, 60
+        )
         
         # Convert solver solution back to database point IDs
         routes = []
