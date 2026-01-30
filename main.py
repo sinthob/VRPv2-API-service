@@ -418,25 +418,28 @@ def convert_solver_solution_to_api_format(
     routes = []
     all_nodes_dict = {}
     
-    # Build all_nodes map
+    # Build all_nodes map (use 1-indexed node IDs to match solver output)
     for idx, node in enumerate(nodes):
-        node_id = idx
+        node_id = idx + 1  # 1-indexed to match solver
         all_nodes_dict[str(node_id)] = Node(
             id=node_id,
             name=node.name,
             coordinate=[node.latitude, node.longitude],
             demand=node.demand,
-            is_hub=(idx == 0),
+            is_hub=(idx == 0),  # First node is hub
             is_delivery=node.is_delivery,
             is_required=node.is_required
         )
     
     # Convert each route from solver format
     for solver_route in solver_solution.routes:
-        # Convert 1-indexed node IDs to 0-indexed
-        route_nodes = [nid - 1 for nid in solver_route.nodes]
-        route_coordinates = [[nodes[i].latitude, nodes[i].longitude] for i in route_nodes]
-        route_names = [nodes[i].name for i in route_nodes]
+        # Solver returns 1-indexed node IDs: [1,2,3,...,20,1]
+        # Keep them as-is (do NOT subtract 1)
+        route_nodes = solver_route.nodes  # Already 1-indexed
+        
+        # Build coordinates and names using 0-indexed access to nodes array
+        route_coordinates = [[nodes[nid - 1].latitude, nodes[nid - 1].longitude] for nid in route_nodes]
+        route_names = [nodes[nid - 1].name for nid in route_nodes]
         
         # Find vehicle
         vehicle = next((v for v in vehicles if v.id == solver_route.vehicle_type), vehicles[0])
@@ -444,10 +447,10 @@ def convert_solver_solution_to_api_format(
         route = Route(
             trip_number=solver_route.vehicle_id,
             vehicle=solver_route.vehicle_type,
-            nodes=route_nodes,
+            nodes=route_nodes,  # 1-indexed: [1, 2, ..., 20, 1]
             coordinates=route_coordinates,
             node_names=route_names,
-            deliveries=[i for i, n in enumerate(nodes) if n.is_delivery and i > 0],
+            deliveries=[nid for nid in route_nodes if nodes[nid - 1].is_delivery and nid > 1],
             distance=solver_route.distance_km,
             cost=solver_route.total_cost,
             fixed_cost=solver_route.fixed_cost,
