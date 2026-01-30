@@ -268,7 +268,10 @@ async def solve_vrp(request: VRPRequest):
             )
         
         # Calculate distance matrix if not provided
+        # CRITICAL: VRP solver expects depot at index 0 (Node 1)
+        # Reorder nodes: [hub] + [other nodes]
         all_nodes = [request.hub] + request.nodes
+        
         if request.distance_matrix is None:
             logger.info("Calculating distance matrix using Haversine formula")
             distance_matrix = calculate_distance_matrix(all_nodes)
@@ -276,10 +279,15 @@ async def solve_vrp(request: VRPRequest):
             distance_matrix = np.array(request.distance_matrix)
             logger.info(f"Using provided distance matrix: {distance_matrix.shape}")
         
-        # Find checkpoint node (is_required=True)
+        # Find checkpoint node (is_required=True OR is_delivery=True)
+        # Checkpoint is typically the dump point where trucks unload before returning
         checkpoint_id = None
         for idx, node in enumerate(all_nodes):
-            if node.is_required and not node.is_delivery:
+            # Skip depot (first node)
+            if idx == 0:
+                continue
+            # Find delivery/required point (usually the dump point)
+            if node.is_delivery or (node.is_required and len(node.demand) == 2 and node.demand[0] == 0 and node.demand[1] == 0):
                 checkpoint_id = idx + 1  # 1-indexed
                 logger.info(f"Found checkpoint at node {checkpoint_id}: {node.name}")
                 break
