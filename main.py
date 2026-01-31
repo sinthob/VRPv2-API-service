@@ -9,7 +9,7 @@ It integrates with the VRPSolverV2 algorithm and matches the Go backend's expect
 from fastapi import FastAPI, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, root_validator
 from typing import List, Optional, Dict
 from datetime import datetime
 import numpy as np
@@ -652,6 +652,14 @@ class GoBackendVehicle(BaseModel):
     capacity_regular: int
     capacity_recycle: int
     fuel_cost_per_km: float
+    # Optional alternate name used by some payloads / examples
+    fuel_cost_per_distance: Optional[float] = None
+
+    @root_validator(pre=True)
+    def _populate_fuel_cost_per_km(cls, values):
+        if "fuel_cost_per_km" not in values and "fuel_cost_per_distance" in values:
+            values["fuel_cost_per_km"] = values["fuel_cost_per_distance"]
+        return values
 
 
 class GoBackendSolveRequest(BaseModel):
