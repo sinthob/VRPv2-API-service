@@ -40,4 +40,4 @@ ENV PYTHONUNBUFFERED=1
 ENV LOG_LEVEL=info
 
 # Run with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--workers", "2", "--log-level", "info"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--workers", "1", "--log-level", "info"]

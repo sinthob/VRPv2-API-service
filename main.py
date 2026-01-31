@@ -7,11 +7,14 @@ It integrates with the VRPSolverV2 algorithm and matches the Go backend's expect
 """
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict
 from datetime import datetime
 import numpy as np
+import asyncio
+import time
 import logging
 import sys
 
@@ -22,6 +25,10 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+# Serialize VRP solves to avoid parallel execution and control memory usage.
+# This queues overlapping solve requests instead of running them concurrently.
+_SOLVE_LOCK = asyncio.Lock()
 
 # Import VRP solver
 try:
@@ -321,15 +328,22 @@ async def solve_vrp(request: VRPRequest):
             )
             solver_vehicles.append(solver_vehicle)
         
-        # Call actual VRPSolverV2
+        # Call actual VRPSolverV2 (single in-flight solve at a time)
         logger.info("Solving VRP using OR-Tools...")
-        solver_solution = solve_vrp_internal(
-            solver_nodes,
-            solver_vehicles,
-            distance_matrix,
-            checkpoint_id,
-            time_limit=request.time_limit or 60
-        )
+        wait_start = time.monotonic()
+        async with _SOLVE_LOCK:
+            waited_s = time.monotonic() - wait_start
+            if waited_s >= 0.25:
+                logger.info(f"Solve request waited {waited_s:.2f}s for the solver lock")
+
+            solver_solution = await run_in_threadpool(
+                solve_vrp_internal,
+                solver_nodes,
+                solver_vehicles,
+                distance_matrix,
+                checkpoint_id,
+                time_limit=request.time_limit or 60,
+            )
         
         # Build solution in Go backend format
         solution_data = convert_solver_solution_to_api_format(
@@ -746,10 +760,22 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
         logger.info(f"Solving with {num_vehicles} vehicles using OR-Tools...")
         
         # Solve using OR-Tools directly (without checkpoint requirement)
-        solver_solution = solve_vrp_without_checkpoint(
-            solver_nodes, best_vehicle, distance_matrix,
-            depot_idx, num_vehicles, 60
-        )
+        # Enforce single in-flight solve at a time to control memory usage.
+        wait_start = time.monotonic()
+        async with _SOLVE_LOCK:
+            waited_s = time.monotonic() - wait_start
+            if waited_s >= 0.25:
+                logger.info(f"Go-backend solve request waited {waited_s:.2f}s for the solver lock")
+
+            solver_solution = await run_in_threadpool(
+                solve_vrp_without_checkpoint,
+                solver_nodes,
+                best_vehicle,
+                distance_matrix,
+                depot_idx,
+                num_vehicles,
+                60,
+            )
         
         # Convert solver solution back to database point IDs
         routes = []
