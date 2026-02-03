@@ -17,6 +17,9 @@ import asyncio
 import time
 import logging
 import sys
+import threading
+from importlib import import_module
+from typing import Any, Tuple
 
 # Configure logging
 logging.basicConfig(
@@ -30,14 +33,61 @@ logger = logging.getLogger(__name__)
 # This queues overlapping solve requests instead of running them concurrently.
 _SOLVE_LOCK = asyncio.Lock()
 
-# Import VRP solver
-try:
-    from solvers.vrp_solver_v2 import VRPSolverV2, Node as SolverNode, Vehicle as SolverVehicle, Solution as SolverSolution
-    SOLVER_AVAILABLE = True
-    logger.info("VRP Solver loaded successfully")
-except ImportError as e:
-    SOLVER_AVAILABLE = False
-    logger.error(f"Failed to load VRP Solver: {e}")
+# -------------------- Lazy solver import (operational) --------------------
+#
+# We intentionally avoid importing the VRP solver module at process startup.
+# The solver module pulls in heavy dependencies (e.g., OR-Tools, pandas, openpyxl)
+# which can increase startup CPU/memory and slow container scale-up.
+#
+# Trade-off: the *first* solve request (or /ready or /warmup) will pay the import
+# cost, so it may be slower right after deploy.
+_SOLVER_IMPORT_LOCK = threading.Lock()
+_SOLVER_SYMBOLS: Tuple[Any, Any, Any, Any] | None = None
+_SOLVER_IMPORT_ATTEMPTED = False
+_SOLVER_IMPORT_ERROR: str | None = None
+
+
+def _get_solver_symbols() -> Tuple[Any, Any, Any, Any]:
+    """Lazily import and cache VRP solver symbols.
+
+    Returns:
+        (VRPSolverV2, Node, Vehicle, Solution)
+
+    Notes:
+        - Imports at most once per process.
+        - On failure, caches the error message to make readiness checks cheap.
+    """
+    global _SOLVER_SYMBOLS, _SOLVER_IMPORT_ATTEMPTED, _SOLVER_IMPORT_ERROR
+
+    if _SOLVER_SYMBOLS is not None:
+        return _SOLVER_SYMBOLS
+
+    with _SOLVER_IMPORT_LOCK:
+        if _SOLVER_SYMBOLS is not None:
+            return _SOLVER_SYMBOLS
+        if _SOLVER_IMPORT_ATTEMPTED and _SOLVER_IMPORT_ERROR is not None:
+            raise ImportError(_SOLVER_IMPORT_ERROR)
+
+        _SOLVER_IMPORT_ATTEMPTED = True
+        try:
+            mod = import_module("solvers.vrp_solver_v2")
+            _SOLVER_SYMBOLS = (mod.VRPSolverV2, mod.Node, mod.Vehicle, mod.Solution)
+            _SOLVER_IMPORT_ERROR = None
+            logger.info("VRP solver module imported lazily")
+            return _SOLVER_SYMBOLS
+        except Exception as e:
+            _SOLVER_IMPORT_ERROR = str(e)
+            logger.error("Failed to lazily import VRP solver: %s", e, exc_info=True)
+            raise
+
+
+def _solver_status_snapshot() -> Dict[str, Any]:
+    """Return solver import status without importing it."""
+    return {
+        "import_attempted": _SOLVER_IMPORT_ATTEMPTED,
+        "imported": _SOLVER_SYMBOLS is not None,
+        "last_error": _SOLVER_IMPORT_ERROR,
+    }
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -220,28 +270,71 @@ def calculate_distance_matrix(nodes: List[VRPNodeInput]) -> np.ndarray:
 @app.get("/", tags=["Health"])
 async def root():
     """Root endpoint"""
+    # Do not import the solver here; keep this endpoint cheap.
+    solver_status = _solver_status_snapshot()
     return {
         "service": "VRP Solver API",
         "version": "2.0.0",
         "status": "running",
-        "solver_available": SOLVER_AVAILABLE
+        # With lazy loading, this means "solver already imported in this process".
+        # Use /ready to actively verify availability.
+        "solver_available": solver_status["imported"],
+        "solver_lazy": True,
     }
 
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint for Dockploy/Docker"""
-    if not SOLVER_AVAILABLE:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="VRP Solver not available"
-        )
-    
+    """Liveness check (cheap).
+
+    Semantics:
+        - MUST be fast and always return 200 if the process is alive.
+        - MUST NOT import/touch the solver or any external dependencies.
+    """
     return {
-        "status": "healthy",
+        "status": "alive",
         "service": "vrp-solver",
         "timestamp": datetime.now().isoformat()
     }
+
+
+@app.get("/ready", tags=["Health"])
+async def readiness_check():
+    """Readiness check.
+
+    This endpoint *does* perform the lazy solver import to verify the process is
+    ready to serve solve requests.
+    """
+    try:
+        _get_solver_symbols()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"VRP Solver not ready: {e}",
+        )
+
+    return {
+        "status": "ready",
+        "service": "vrp-solver",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.post("/warmup", tags=["Health"])
+async def warmup_solver():
+    """Optional warm-up endpoint.
+
+    Use this to pre-load the solver after deploy so the first solve request
+    doesn't pay the import cost.
+    """
+    try:
+        _get_solver_symbols()
+        return {"success": True, "message": "Solver warmed up"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Warm-up failed: {e}",
+        )
 
 
 @app.post("/api/vrp/solve", response_model=VRPResponse, tags=["VRP"])
@@ -252,7 +345,10 @@ async def solve_vrp(request: VRPRequest):
     This endpoint accepts a VRP request with nodes, vehicles, and constraints,
     then returns an optimized solution with routes and costs.
     """
-    if not SOLVER_AVAILABLE:
+    # Lazy-load heavy solver module only when we actually handle a solve request.
+    try:
+        _, SolverNode, SolverVehicle, _ = _get_solver_symbols()
+    except Exception:
         return VRPResponse(
             success=False,
             message="VRP Solver is not available. Please check solver installation."
@@ -372,17 +468,16 @@ async def solve_vrp(request: VRPRequest):
 
 
 def solve_vrp_internal(
-    nodes: List[SolverNode],
-    vehicles: List[SolverVehicle],
+    nodes: List[Any],
+    vehicles: List[Any],
     distance_matrix: np.ndarray,
     checkpoint_id: int,
     time_limit: int = 60
-) -> SolverSolution:
+) -> Any:
     """
     Solve VRP using VRPSolverV2 internal algorithm (with checkpoint)
     """
-    from solvers.vrp_solver_v2 import VRPSolverV2
-    
+    VRPSolverV2, _, _, _ = _get_solver_symbols()
     solver = VRPSolverV2.__new__(VRPSolverV2)
     
     # Use best vehicle (lowest fuel cost)
@@ -422,13 +517,13 @@ def solve_vrp_internal(
 
 
 def solve_vrp_without_checkpoint(
-    nodes: List[SolverNode],
-    vehicle: SolverVehicle,
+    nodes: List[Any],
+    vehicle: Any,
     distance_matrix: np.ndarray,
     depot_idx: int,
     num_vehicles: int,
     time_limit: int = 60
-) -> SolverSolution:
+) -> Any:
     """
     Solve VRP without checkpoint requirement (for Go backend)
     Routes: depot → collection nodes → depot
@@ -572,7 +667,7 @@ def solve_vrp_without_checkpoint(
 
 
 def convert_solver_solution_to_api_format(
-    solver_solution: SolverSolution,
+    solver_solution: Any,
     nodes: List[VRPNodeInput],
     vehicles: List[VRPVehicle]
 ) -> VRPSolution:
@@ -700,7 +795,10 @@ async def solve_for_go_backend(request: GoBackendSolveRequest):
         logger.info(f"Hub point ID: {request.hub_point_id}")
         logger.info(f"Point IDs by index: {request.point_ids_by_index}")
         
-        if not SOLVER_AVAILABLE:
+        # Lazy-load heavy solver module only when we actually handle a solve request.
+        try:
+            _, SolverNode, SolverVehicle, _ = _get_solver_symbols()
+        except Exception:
             return GoBackendSolveResponse(
                 success=False,
                 routes=[],
