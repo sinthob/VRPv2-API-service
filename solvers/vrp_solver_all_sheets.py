@@ -16,8 +16,12 @@ import pandas as pd
 import json
 import math
 import openpyxl
+import logging
 from pathlib import Path
 from typing import Dict, List
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from ortools.constraint_solver import routing_enums_pb2
@@ -368,6 +372,8 @@ class MultiSheetVRPSolver:
         vehicle_id = 0
 
         while unassigned:
+            unassigned_count_at_start = len(unassigned)
+
             route = [depot_id]
             general_load = 0
             recycle_load = 0
@@ -398,6 +404,33 @@ class MultiSheetVRPSolver:
                 route_distance += distance_matrix[current][best_node]
                 unassigned.remove(best_node)
                 current = best_node
+
+            # Progress guard: if we couldn't assign any node in this outer iteration,
+            # continuing would loop forever (unassigned never shrinks) and can peg CPU.
+            if len(unassigned) == unassigned_count_at_start:
+                msg = (
+                    "No feasible node can be assigned under current constraints; "
+                    "stopping clustering solver to avoid infinite loop"
+                )
+                logger.warning(
+                    "[MultiSheetVRPSolver._solve_clustering] %s (remaining_unassigned=%d)",
+                    msg,
+                    len(unassigned),
+                )
+
+                total_distance = sum(r['distance'] for r in routes)
+                total_fixed = len(routes) * fixed_cost
+                total_fuel = total_distance * fuel_cost
+                return {
+                    'status': 'INFEASIBLE',
+                    'num_vehicles_used': len(routes),
+                    'total_distance': total_distance,
+                    'total_fixed_cost': total_fixed,
+                    'total_fuel_cost': total_fuel,
+                    'total_cost': total_fixed + total_fuel,
+                    'routes': routes,
+                    'validation_errors': [msg],
+                }
 
             route_distance += distance_matrix[current][depot_id]
             route.append(depot_id)

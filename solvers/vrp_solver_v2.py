@@ -23,9 +23,13 @@ import json
 import math
 import numpy as np
 import openpyxl
+import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+
+
+logger = logging.getLogger(__name__)
 
 try:
     from ortools.constraint_solver import routing_enums_pb2
@@ -452,6 +456,8 @@ class VRPSolverV2:
         while unvisited:
             vehicle_id += 1
 
+            unvisited_count_at_start = len(unvisited)
+
             # Start new route at depot
             current = depot_idx
             route_nodes = [nodes[depot_idx].id]  # Start with Node 1
@@ -490,6 +496,38 @@ class VRPSolverV2:
                 recycle_load += nodes[best_node].recycle_demand
                 unvisited.remove(best_node)
                 current = best_node
+
+            # Progress guard: if we couldn't assign any node in this outer iteration,
+            # continuing would loop forever (unvisited never shrinks) and can peg CPU.
+            if len(unvisited) == unvisited_count_at_start:
+                msg = (
+                    "No feasible node can be assigned under current constraints; "
+                    "stopping heuristic solver to avoid infinite loop"
+                )
+                logger.warning(
+                    "[VRPSolverV2._solve_heuristic] %s (remaining_unvisited=%d)",
+                    msg,
+                    len(unvisited),
+                )
+
+                # Return partial solution collected so far (best-effort) but mark infeasible.
+                total_distance_m = sum(r.distance_meters for r in routes)
+                total_distance_km = total_distance_m / 1000.0
+                total_fixed = sum(r.fixed_cost for r in routes)
+                total_fuel = sum(r.fuel_cost for r in routes)
+                return Solution(
+                    status='INFEASIBLE',
+                    routes=routes,
+                    num_vehicles_used=len(routes),
+                    total_distance_meters=total_distance_m,
+                    total_distance_km=total_distance_km,
+                    total_fixed_cost=total_fixed,
+                    total_fuel_cost=total_fuel,
+                    total_cost=total_fixed + total_fuel,
+                    all_nodes_visited=False,
+                    all_routes_valid=False,
+                    validation_errors=[msg],
+                )
 
             # Go to checkpoint before returning to depot
             route_nodes.append(nodes[checkpoint_idx].id)
@@ -552,7 +590,9 @@ class VRPSolverV2:
         6. No vehicle exceeds capacity
         7. All nodes are visited
         """
-        errors = []
+        # Preserve any pre-existing errors (e.g., from progress guards) and append
+        # validation results. Normal solve paths currently pass an empty list.
+        errors = list(solution.validation_errors) if solution.validation_errors else []
         checkpoint_node_id = nodes[checkpoint_idx].id
 
         # Track visited nodes
